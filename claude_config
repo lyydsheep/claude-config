@@ -1,0 +1,127 @@
+#!/bin/bash
+
+# --- 配置 ---
+SETTINGS_FILE="$HOME/.claude/settings.json"
+
+# --- 函数定义 ---
+
+# 函数：显示所有命令的用法
+show_help() {
+    echo "=================================================="
+    echo " Claude Config Manager - 版本 1.5 (最终版)"
+    echo "=================================================="
+    echo "用法: $0 <命令> [参数]"
+    echo ""
+    echo "可用命令:"
+    echo "  help                    : 显示此帮助信息。"
+    echo "  show                    : 显示当前配置文件的 'env' 字段内容 (自动过滤注释)。"
+    echo "  model <新模型名>        : 更新所有 ANTHROPIC_MODEL 相关的字段为指定模型名。"
+    echo "  baseurl <新的URL>       : 更新 ANTHROPIC_BASE_URL 字段。"
+    echo "  token <新的Token>       : 更新 ANTHROPIC_AUTH_TOKEN 字段。"
+    echo ""
+    echo "--- 数据安全保证 ---"
+    echo "所有修改操作 ('model', 'baseurl', 'token') 在执行前都会创建原文件的备份。"
+    echo "=================================================="
+    exit 0
+}
+
+# 函数：执行备份 (仅在修改时执行)
+backup_config() {
+    local command_name="$1"
+    if [ ! -f "$SETTINGS_FILE" ]; then
+        echo "错误：配置文件 $SETTINGS_FILE 不存在。"
+        exit 1
+    fi
+    
+    # 只有在修改操作时才备份
+    if [[ "$command_name" == "model" || "$command_name" == "baseurl" || "$command_name" == "token" ]]; then
+        # 使用一个基于时间戳和命令名的唯一备份文件名
+        BACKUP_FILE="${SETTINGS_FILE}.bak.$(date +%Y%m%d%H%M%S)_$command_name"
+        cp "$SETTINGS_FILE" "$BACKUP_FILE"
+        echo "✅ 已备份原文件到 $BACKUP_FILE"
+    fi
+}
+
+# 函数：执行 JSON 更新并检查
+update_json() {
+    local jq_command="$1"
+    
+    backup_config "$COMMAND"
+    TEMP_FILE=$(mktemp /tmp/settings.json.XXXXXX)
+    
+    # 关键步骤：读取文件前，过滤掉注释行和空行，确保 jq 能够解析
+    cat "$SETTINGS_FILE" | grep -v '^#' | grep -v '^\s*$' > "$TEMP_FILE.clean"
+    
+    # 1. 尝试使用 jq 处理清理后的文件并写入临时文件
+    if jq "$jq_command" "$TEMP_FILE.clean" > "$TEMP_FILE"; then
+        # 2. 只有 jq 成功后，才进行原子替换 (mv 操作)
+        mv "$TEMP_FILE" "$SETTINGS_FILE"
+        echo "✅ 配置更新成功！"
+    else
+        # 3. 如果 jq 失败，删除所有临时文件，原文件保持不变
+        rm -f "$TEMP_FILE" "$TEMP_FILE.clean"
+        echo "❌ JSON 处理失败 (jq 错误)。原文件未被修改。"
+        exit 1
+    fi
+    # 清理中间清理文件
+    rm -f "$TEMP_FILE.clean"
+}
+
+# --- 主逻辑 ---
+
+COMMAND="$1"
+PARAM="$2" 
+
+# 检查是否提供了命令
+if [ -z "$COMMAND" ]; then
+    show_help
+fi
+
+case "$COMMAND" in
+    help)
+        show_help
+        ;;
+
+    show)
+        if [ ! -f "$SETTINGS_FILE" ]; then
+            echo "错误：配置文件 $SETTINGS_FILE 不存在。"
+            exit 1
+        fi
+        echo "--- 当前可解析的 'env' 配置内容: $SETTINGS_FILE ---"
+        # 先清理注释，再用 jq 打印 .env 字段，并美化输出
+        cat "$SETTINGS_FILE" | grep -v '^#' | grep -v '^\s*$' | jq '.env'
+        ;;
+
+    model | baseurl | token) 
+        if [ -z "$PARAM" ]; then
+            echo "错误: '$COMMAND' 命令需要一个参数。"
+            show_help
+        fi
+        
+        if [ "$COMMAND" == "model" ]; then
+            echo "--- 正在更新所有模型参数为: $PARAM ---"
+            # 修正后的 JQ 表达式：匹配所有以 ANTHROPIC_ 开头且包含 MODEL 的键
+            JQ_CMD='.env |= with_entries(
+                if (.key | startswith("ANTHROPIC_") and contains("MODEL")) then
+                    .value = "'"$PARAM"'"
+                else
+                    .
+                end
+            )'
+        elif [ "$COMMAND" == "baseurl" ]; then
+            echo "--- 正在更新 ANTHROPIC_BASE_URL 为: $PARAM ---"
+            JQ_CMD=".env.ANTHROPIC_BASE_URL = \"$PARAM\""
+        elif [ "$COMMAND" == "token" ]; then
+            echo "--- 正在更新 ANTHROPIC_AUTH_TOKEN (Token 长度: ${#PARAM}) ---"
+            JQ_CMD=".env.ANTHROPIC_AUTH_TOKEN = \"$PARAM\""
+        fi
+        
+        update_json "$JQ_CMD"
+        echo "文件已更新: $SETTINGS_FILE"
+        ;;
+
+    *)
+        echo "错误: 未知命令 '$COMMAND'"
+        show_help
+        ;;
+esac
